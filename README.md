@@ -15,7 +15,7 @@ Documentación paso a paso de cómo convertí un **MacBook Pro de 2012** en un s
 | **Sistema operativo** | Ubuntu Server 26.04.1 LTS (antes tenía Fedora, que se borró) |
 | **Nombre del servidor** | `homelab01` |
 | **Servicios instalados** | SSH, firewall (UFW), Docker, Tailscale (VPN), Pi-hole (bloqueo de anuncios y DNS) |
-| **Seguridad aplicada** | Firewall, SSH solo con llave (sin contraseña), sin login de root, VPN sin abrir puertos en el router |
+| **Seguridad aplicada** | Firewall, SSH solo con llave, sin login de root, fail2ban, VPN sin abrir puertos, copias cifradas automáticas | 
 | **Consumo estimado** | 8 a 15 W en reposo (estimación, no medido) |
 
 ### Qué logré
@@ -289,6 +289,135 @@ El router asigna IPs por DHCP y pueden cambiar. Un servidor necesita una direcci
 
 **Qué pasa si cambio de ordenador:** creo una llave nueva en el equipo nuevo, añado su parte pública a `~/.ssh/authorized_keys` del servidor (desde el equipo viejo, mientras aún puedo entrar) y, si dejo de usar el viejo, borro su línea de ese archivo.
 
+Paso 14. Copias de seguridad automáticas (restic)
+
+Por qué: un servidor puede fallar (disco dañado, error mío, apagón brusco). Una copia de seguridad es un duplicado de lo importante guardado en otro dispositivo, para poder recuperarlo. Si la copia está en el mismo disco que los originales, no protege de nada.
+
+Regla 3-2-1: 3 copias de los datos, en 2 tipos de medios distintos, con 1 copia fuera de casa. Esta guía cubre la copia local; la copia fuera de casa queda pendiente (ver Limitaciones).
+
+Herramienta: restic. Hace copias cifradas, guarda versiones con fecha y solo copia lo que cambió, así que ocupan muy poco espacio.
+
+Qué copio:
+
+Ruta	Qué contiene
+~/pihole	El docker-compose.yml y la configuración de Pi-hole
+/etc	Configuración del sistema: red, firewall, SSH, fail2ban, hora
+~/.ssh	Las llaves autorizadas para entrar al servidor
+
+Qué no copio: el sistema operativo y las imágenes de Docker, porque se reinstalan o se vuelven a descargar solos. Lo valioso es la configuración.
+
+Destino: una memoria USB de 7 GB formateada en NTFS, conectada al servidor.
+
+14.1 Identificar la USB (sin equivocarme de disco)
+
+Antes de montar nada, hay que estar seguro de cuál es cada dispositivo. Estos comandos solo leen, no cambian nada:
+
+bash
+lsblk -f
+lsblk -o NAME,SIZE,TYPE,TRAN,MODEL
+
+La USB aparece con TRAN = usb y su tamaño (en mi caso ~7,5 GB). El disco interno del servidor aparece como sata y no se toca.
+
+14.2 Instalar y montar
+bash
+sudo apt install -y ntfs-3g restic
+sudo mkdir -p /mnt/backup
+sudo mount -o uid=$(id -u),gid=$(id -g) /dev/sdb2 /mnt/backup   # sdb2 = mi USB; el tuyo puede ser otro
+mountpoint /mnt/backup
+
+Importante: mountpoint debe responder is a mountpoint antes de crear el repositorio. Si no, la copia se guardaría en el disco interno en lugar de la USB.
+
+14.3 Crear el repositorio de copias
+bash
+restic init --repo /mnt/backup/restic
+
+Pide una contraseña de cifrado. Se guarda en un gestor de contraseñas antes de escribirla: restic no puede recuperarla ni restablecerla, y sin ella las copias no se pueden abrir.
+
+14.4 Primera copia
+bash
+sudo restic -r /mnt/backup/restic backup ~/pihole ~/.ssh /etc
+
+La primera vez la hice sin sudo y salió el aviso at least one source file could not be read: algunos archivos de /etc solo los puede leer el administrador. Con sudo la copia queda completa.
+
+14.5 Probar la restauración
+
+Una copia que nunca se ha probado restaurar no es de fiar:
+
+bash
+sudo restic -r /mnt/backup/restic restore latest --target /tmp/prueba-restauracion --include /etc/hostname
+sudo cat /tmp/prueba-restauracion/etc/hostname     # debe mostrar el nombre del servidor
+sudo rm -r /tmp/prueba-restauracion
+
+Se lee con sudo cat porque, al restaurar con sudo, los archivos quedan a nombre de root.
+
+14.6 Montaje automático de la USB
+
+Sin esto, la USB deja de estar montada cada vez que el servidor se reinicia y las copias fallarían.
+
+bash
+sudo cp /etc/fstab ~/fstab.bak                        # copia de seguridad del archivo
+sudo -v                                               # pide la contraseña una sola vez
+UUID_USB=$(sudo blkid -s UUID -o value /dev/sdb2)     # identificador único de la USB
+echo "UUID=$UUID_USB /mnt/backup ntfs-3g uid=$(id -u),gid=$(id -g),nofail,x-systemd.device-timeout=10 0 0" | sudo tee -a /etc/fstab
+sudo umount /mnt/backup && sudo mount -a && mountpoint /mnt/backup
+sudo systemctl daemon-reload
+Se usa el UUID y no sdb2, porque el nombre del dispositivo puede cambiar entre reinicios y el UUID no.
+nofail evita que el servidor se quede bloqueado al arrancar si la USB no está conectada.
+Si algo sale mal: sudo cp ~/fstab.bak /etc/fstab.
+14.7 Automatizar la copia cada noche
+
+a) Guardar la contraseña de restic en un archivo que solo lee el administrador:
+
+bash
+sudo nano /root/.restic-password      # escribir solo la contraseña, guardar y salir
+sudo chmod 600 /root/.restic-password
+sudo ls -l /root/.restic-password     # debe empezar por -rw-------
+
+b) Crear el script /usr/local/bin/backup-homelab.sh:
+
+bash
+#!/bin/bash
+set -euo pipefail
+export RESTIC_REPOSITORY=/mnt/backup/restic
+export RESTIC_PASSWORD_FILE=/root/.restic-password
+if ! mountpoint -q /mnt/backup; then
+  echo "$(date): USB no montada, copia cancelada"
+  exit 1
+fi
+restic backup /home/usuario/pihole /home/usuario/.ssh /etc
+restic forget --keep-daily 7 --keep-weekly 4 --keep-monthly 6 --prune
+La comprobación mountpoint impide que la copia se guarde en el disco interno si la USB no está.
+restic forget --prune aplica la política de retención: conserva 7 copias diarias, 4 semanales y 6 mensuales, y borra el resto para no llenar la USB.
+
+Se hace ejecutable y se prueba a mano:
+
+bash
+sudo chmod +x /usr/local/bin/backup-homelab.sh
+sudo /usr/local/bin/backup-homelab.sh
+
+c) Programarlo con cron (todos los días a las 3:30):
+
+bash
+echo "30 3 * * * root /usr/local/bin/backup-homelab.sh >> /var/log/backup-homelab.log 2>&1" | sudo tee /etc/cron.d/backup-homelab
+sudo chmod 644 /etc/cron.d/backup-homelab
+systemctl is-active cron              # debe responder: active
+
+d) Verificar al día siguiente:
+
+bash
+sudo tail -20 /var/log/backup-homelab.log
+sudo restic -r /mnt/backup/restic --password-file /root/.restic-password snapshots
+Problemas que encontré en este paso
+Problema	Causa	Solución
+Aviso at least one source file could not be read	La primera copia se hizo sin permisos de administrador	Repetirla con sudo
+sudo rechazaba la contraseña varias veces	El comando usaba sudo dos veces a la vez y los dos avisos se estorbaban	Usar un solo sudo por comando y guardar el UUID en una variable antes
+El bloque pegado con EOF se quedó esperando (>)	El EOF final tenía espacios delante y no se reconoció como cierre	Pegar el bloque con EOF en la primera columna, o usar printf
+cat daba Permission denied tras restaurar	Con sudo, los archivos restaurados quedan a nombre de root	Leerlos con sudo cat
+Limitaciones (lo que esta copia NO resuelve)
+No es una copia fuera de casa. La USB está conectada al mismo equipo: un robo, un incendio o una sobretensión se llevarían ambos. Para cumplir la regla 3-2-1, falta una copia en otro lugar (por ejemplo, almacenamiento en la nube cifrado).
+Las memorias USB se desgastan antes que los discos si escriben cada noche. Hay que comprobar de vez en cuando que la restauración sigue funcionando.
+La contraseña de restic está guardada en el servidor para poder automatizar. Quien controle el equipo tendría acceso a ella, por eso se guarda además en un gestor de contraseñas.
+El servidor debe estar encendido a las 3:30 y con la USB conectada. Si no, el script se cancela y lo anota en el registro.
 ---
 
 ## 5. Problemas que encontré y cómo los resolví
@@ -314,7 +443,7 @@ El router asigna IPs por DHCP y pueden cambiar. Un servidor necesita una direcci
 - **Contenedores:** qué es Docker y cómo se despliega un servicio con Compose.
 - **VPN:** acceso remoto sin abrir puertos.
 - **Buenas prácticas:** probar los cambios con una vía de escape (`netplan try`, sesión SSH de respaldo) y documentar.
-
+- **copias cifradas con restic** política de retención, montaje automático con fstab y tareas programadas con cron.
 ---
 
 ## 7. Observaciones del equipo
@@ -328,8 +457,8 @@ El router asigna IPs por DHCP y pueden cambiar. Un servidor necesita una direcci
 
 ## 8. Pendiente / próximos pasos
 
-- [ ] Comprobar e instalar **fail2ban** (bloqueo automático de IPs que fallan al entrar por SSH).
-- [ ] **Copias de seguridad** con `restic` a un disco externo y **probar la restauración**.
+- [x] Comprobar e instalar **fail2ban** (bloqueo automático de IPs que fallan al entrar por SSH).
+- [x] **Copias de seguridad** con `restic` a un disco externo y **probar la restauración**.
 - [ ] Configurar el **apagado ordenado** con poca batería.
 - [ ] Montar una **nube personal** (por ejemplo Nextcloud, con Docker), accediendo solo por Tailscale.
 - [ ] Opcional: `ssh-agent` en Windows para no escribir la frase en cada conexión.
