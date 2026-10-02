@@ -408,6 +408,12 @@ bash
 sudo tail -20 /var/log/backup-homelab.log
 sudo restic -r /mnt/backup/restic --password-file /root/.restic-pas---
 
+Limitaciones (lo que esta copia NO resuelve)
+No es una copia fuera de casa. La USB está conectada al mismo equipo: un robo, un incendio o una sobretensión se llevarían ambos. Para cumplir la regla 3-2-1, falta una copia en otro lugar (por ejemplo, almacenamiento en la nube cifrado).
+Las memorias USB se desgastan antes que los discos si escriben cada noche. Hay que comprobar de vez en cuando que la restauración sigue funcionando.
+La contraseña de restic está guardada en el servidor para poder automatizar. Quien controle el equipo tendría acceso a ella, por eso se guarda además en un gestor de contraseñas.
+El servidor debe estar encendido a las 3:30 y con la USB conectada. Si no, el script se cancela y lo anota en el registro.
+
 ## 5. Problemas que encontré y cómo los resolví
 
 | Problema | Causa | Solución |
@@ -420,6 +426,11 @@ sudo restic -r /mnt/backup/restic --password-file /root/.restic-pas---
 | Probé SSH desde dentro del propio servidor | Confusión sobre qué ventana usar | Hacer las pruebas siempre desde otro equipo (el prompt de Windows empieza por `PS C:\`) |
 | Comando pegado con caracteres raros (`event not found`) | Pegado mal formado en la terminal | No hizo daño; volver a pegar el comando bien |
 | `ssh-agent` en Windows: *Acceso denegado* | Faltaban permisos de administrador | Lo dejé pendiente, es solo una comodidad (recordar la frase de la llave) |
+|Aviso at least one source file could not be read | La primera copia se hizo sin permisos de administrador | Repetirla con sudo |
+| sudo rechazaba la contraseña varias veces | El comando usaba sudo dos veces a la vez y los dos avisos se estorbaban | Usar un solo sudo por comando y guardar el UUID en una variable antes |
+| El bloque pegado con EOF se quedó esperando (>) | El EOF final tenía espacios delante y no se reconoció como cierre | Pegar el bloque con EOF en la primera columna, o usar printf |
+| cat daba Permission denied tras restaurar | Con sudo, los archivos restaurados quedan a nombre de root | Leerlos con sudo cat |
+
 
 ---
 
