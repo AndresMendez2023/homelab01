@@ -403,9 +403,10 @@ sudo chmod 644 /etc/cron.d/backup-homelab
 systemctl is-active cron              # debe responder: active
 
 d) Verificar al día siguiente:
+
+bash
 sudo tail -20 /var/log/backup-homelab.log
-sudo restic -r /mnt/backup/restic --password-file /root/.restic-password snapshots
----
+sudo restic -r /mnt/backup/restic --password-file /root/.restic-pas---
 
 ## 5. Problemas que encontré y cómo los resolví
 
