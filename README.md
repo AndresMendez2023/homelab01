@@ -17,6 +17,8 @@ Documentación paso a paso de cómo convertí un **MacBook Pro de 2012** en un s
 | **Servicios instalados** | SSH, firewall (UFW), Docker, Tailscale (VPN), Pi-hole (bloqueo de anuncios y DNS) |
 | **Seguridad aplicada** | Firewall, SSH solo con llave, sin login de root, fail2ban, VPN sin abrir puertos, copias cifradas automáticas | 
 | **Consumo estimado** | 8 a 15 W en reposo (estimación, no medido) |
+| **Servicios instalados** | SSH, firewall (UFW), Docker, Tailscale (VPN), Pi-hole, Nextcloud (nube personal) |
+| **Seguridad aplicada** | Firewall, SSH solo con llave, sin login de root, fail2ban, VPN sin abrir puertos, HTTPS dentro de la VPN, copias cifradas automáticas |
 
 ### Qué logré
 
@@ -38,6 +40,7 @@ Documentación paso a paso de cómo convertí un **MacBook Pro de 2012** en un s
                                           ├─ Docker
                                           │    └─ Pi-hole (DNS y bloqueo de anuncios)
                                           └─ Tailscale (VPN)
+                                          └─ Nextcloud (nube) + PostgreSQL
                                           │
                                   [ Router ]── Internet
 ```
@@ -64,7 +67,13 @@ Documentación paso a paso de cómo convertí un **MacBook Pro de 2012** en un s
 | **Pi-hole** | Programa que actúa como DNS y bloquea dominios de publicidad y rastreo |
 | **Llave SSH** | Par de archivos (privada y pública) que sustituye a la contraseña para entrar por SSH |
 | **sudo** | Ejecutar un comando con permisos de administrador |
-
+| **Nextcloud** |	Programa que convierte un servidor en una nube personal de archivos |
+| **Sincronización** |	Mantener una carpeta idéntica en dos dispositivos. Si borras en uno, se borra en el otro |
+| **Copia de seguridad** |	Duplicado guardado en otro dispositivo, con versiones, para recuperar datos. No es lo mismo que sincronizar |
+| **HTTPS** | certificado	Conexión cifrada y verificada por un certificado |
+| **Volcado de base de datos** |	Archivo con todo el contenido de una base de datos, que se puede restaurar |
+| **Modo mantenimiento** |	Estado en que Nextcloud no acepta cambios, para copiar datos coherentes |
+| **Cron** |	Programador de tareas que ejecuta comandos a una hora fija |
 ---
 
 ## 4. Paso a paso
@@ -414,6 +423,186 @@ Las memorias USB se desgastan antes que los discos si escriben cada noche. Hay q
 La contraseña de restic está guardada en el servidor para poder automatizar. Quien controle el equipo tendría acceso a ella, por eso se guarda además en un gestor de contraseñas.
 El servidor debe estar encendido a las 3:30 y con la USB conectada. Si no, el script se cancela y lo anota en el registro.
 
+Paso 15. Nube personal con Nextcloud (Docker)
+
+Qué es: Nextcloud es una alternativa propia a Google Drive o Dropbox. Los archivos viven en mi servidor, y los puedo sincronizar con el PC y el móvil, compartir y recuperar desde la papelera.
+
+Cómo se instala: con Docker Compose, igual que Pi-hole. Usa dos contenedores: la aplicación y una base de datos PostgreSQL (donde se guardan usuarios, carpetas y metadatos).
+
+Crear la carpeta y el archivo de configuración:
+bash
+   mkdir -p ~/nextcloud && cd ~/nextcloud
+   nano docker-compose.yml
+Contenido (cambiar las dos contraseñas por otras largas, solo con letras y números, y guardarlas en un gestor de contraseñas; la de la base de datos debe ser idéntica en las dos líneas donde aparece):
+yaml
+   services:
+     db:
+       image: postgres:16-alpine
+       container_name: nextcloud-db
+       restart: unless-stopped
+       environment:
+         POSTGRES_DB: nextcloud
+         POSTGRES_USER: nextcloud
+         POSTGRES_PASSWORD: "CLAVE_BASE_DATOS"
+       volumes:
+         - ./db:/var/lib/postgresql/data
+
+     app:
+       image: nextcloud:latest
+       container_name: nextcloud
+       restart: unless-stopped
+       depends_on:
+         - db
+       ports:
+         - "8081:80"
+       environment:
+         POSTGRES_HOST: db
+         POSTGRES_DB: nextcloud
+         POSTGRES_USER: nextcloud
+         POSTGRES_PASSWORD: "CLAVE_BASE_DATOS"
+         NEXTCLOUD_ADMIN_USER: admin
+         NEXTCLOUD_ADMIN_PASSWORD: "CLAVE_ADMIN"
+         NEXTCLOUD_TRUSTED_DOMAINS: "IP-LOCAL-DEL-SERVIDOR IP-TAILSCALE-DEL-SERVIDOR localhost"
+       volumes:
+         - ./nextcloud:/var/www/html
+Arrancar y comprobar:
+bash
+   docker compose up -d
+   docker ps
+   docker logs nextcloud --tail 20
+
+La instalación inicial termina cuando el registro muestra Nextcloud was successfully installed y resuming normal operations. 4. Abrir http://<IP-DEL-SERVIDOR>:8081 e iniciar sesión con admin.
+
+Buenas prácticas aplicadas
+
+Crear una cuenta normal para el uso diario (menú de avatar → Cuentas → Nueva cuenta) y usar admin solo para administrar. Si una cuenta de uso diario se ve comprometida, no tiene control total.
+Revisar los avisos en Administración → Resumen y corregir los que importan:
+bash
+  # Ventana de mantenimiento: tareas pesadas de madrugada (la hora es UTC)
+  docker exec -u www-data nextcloud php occ config:system:set maintenance_window_start --type=integer --value=4
+  # Migraciones pendientes de tipos de archivo
+  docker exec -u www-data nextcloud php occ maintenance:repair --include-expensive
+
+Ojo de seguridad: Docker publica el puerto 8081 saltándose las reglas de UFW. Cualquier equipo de mi red local puede llegar a él, así que no se abre ese puerto en el router. El acceso desde fuera de casa es solo por Tailscale.
+
+Paso 16. HTTPS con Tailscale (sin abrir puertos)
+
+Por qué: Nextcloud avisa de que se accede por HTTP, y algunas funciones del navegador y las apps móviles lo exigen. Tailscale puede dar un certificado válido y publicar el servicio solo dentro de mi red privada.
+
+En el panel de administración de Tailscale (sección DNS): comprobar que MagicDNS está activo y pulsar Enable HTTPS.
+En el servidor:
+bash
+   sudo tailscale serve --bg 8081
+   tailscale serve status
+
+Muestra una dirección del tipo https://homelab01.tailNNNN.ts.net, marcada como tailnet only. 3. Enseñar a Nextcloud esa dirección y que está detrás de HTTPS:
+
+bash
+   docker exec -u www-data nextcloud php occ config:system:set trusted_domains 4 --value=homelab01.tailNNNN.ts.net
+   docker exec -u www-data nextcloud php occ config:system:set overwriteprotocol --value=https
+   docker exec -u www-data nextcloud php occ config:system:set overwrite.cli.url --value=https://homelab01.tailNNNN.ts.net
+   docker exec -u www-data nextcloud php occ config:system:set trusted_proxies 0 --value=172.16.0.0/12
+Desde ese momento se usa siempre la dirección HTTPS. Si algo sale mal: docker exec -u www-data nextcloud php occ config:system:delete overwriteprotocol.
+
+Qué se usa y qué no: tailscale serve publica solo para mis dispositivos. tailscale funnel lo publicaría en internet, y no lo uso.
+
+Aviso que se queda: Nextcloud sigue recomendando la cabecera HSTS. Se añade en el servidor web del contenedor, y al ir todo por una VPN cifrada aporta poco, así que decidí dejarlo.
+
+Paso 17. Sincronizar archivos desde Windows
+Instalar el cliente de escritorio desde la página oficial (nextcloud.com/install, sección de clientes; no el paquete del servidor).
+Con Tailscale activo, iniciar sesión con la dirección HTTPS y la cuenta normal.
+Elegir la carpeta de sincronización en un disco con mucho espacio libre, no en el disco del sistema, y marcar Sincronizar todo.
+Probar con una carpeta pequeña antes de subir todo, y comprobar que aparece en la web.
+Subir el resto copiando, no moviendo, por tandas. Hay que renombrar las carpetas de nombre larguísimo para que la ruta no supere unos 260 caracteres de Windows.
+Comprobar al terminar que coinciden el número de archivos y el tamaño.
+
+Concepto clave: sincronizar no es hacer una copia de seguridad. Si borro un archivo en el PC, se borra también en la nube. La protección real es la copia del paso siguiente.
+
+Paso 18. Copias de seguridad de Nextcloud (disco externo)
+
+Qué copio y cómo: los archivos de Nextcloud, el docker-compose.yml y un volcado de la base de datos. No se copian los archivos de la base de datos mientras funciona, porque la copia saldría corrupta. Mientras dura la copia, Nextcloud pasa a modo mantenimiento unos segundos.
+
+Destino: un disco duro externo que ya tenía mis archivos. No se formatea. Las copias van en una carpeta aparte dentro de él.
+
+Identificar el disco sin equivocarme:
+bash
+   lsblk -o NAME,SIZE,TYPE,FSTYPE,LABEL,TRAN,MODEL
+Ver el espacio libre de sus particiones montándolas en solo lectura:
+bash
+   sudo mkdir -p /mnt/disco-1 /mnt/disco-2
+   sudo mount -o ro /dev/sdX1 /mnt/disco-1
+   df -h /mnt/disco-1
+
+Elegí la partición con más espacio libre. sdX1 es un ejemplo, y el nombre real depende de cada equipo. 3. Montarlo con permiso de escritura y crear la carpeta de copias:
+
+bash
+   sudo umount /mnt/disco-1 /mnt/disco-2
+   sudo mkdir -p /mnt/backup-externo
+   sudo mount -o uid=$(id -u),gid=$(id -g) /dev/sdX1 /mnt/backup-externo
+   mkdir /mnt/backup-externo/restic-nextcloud
+Crear el repositorio cifrado (con una contraseña distinta a la de las otras copias, guardada antes en un gestor de contraseñas) y guardarla en un archivo que solo lee el administrador:
+bash
+   restic init --repo /mnt/backup-externo/restic-nextcloud
+   sudo nano /root/.restic-password-nextcloud
+   sudo chmod 600 /root/.restic-password-nextcloud
+Script /usr/local/bin/backup-nextcloud.sh:
+bash
+   #!/bin/bash
+   set -euo pipefail
+   export RESTIC_REPOSITORY=/mnt/backup-externo/restic-nextcloud
+   export RESTIC_PASSWORD_FILE=/root/.restic-password-nextcloud
+   NC_DIR=/home/usuario/nextcloud
+   DUMP_DIR=/var/backups/nextcloud-db
+
+   if ! mountpoint -q /mnt/backup-externo; then
+     echo "$(date): disco externo no montado, copia cancelada"
+     exit 1
+   fi
+
+   mkdir -p "$DUMP_DIR"
+   chmod 700 "$DUMP_DIR"
+
+   docker exec -u www-data nextcloud php occ maintenance:mode --on
+   trap 'docker exec -u www-data nextcloud php occ maintenance:mode --off' EXIT
+
+   docker exec nextcloud-db pg_dump -U nextcloud nextcloud > "$DUMP_DIR/nextcloud.sql"
+   restic backup "$NC_DIR/nextcloud" "$NC_DIR/docker-compose.yml" "$DUMP_DIR"
+
+   docker exec -u www-data nextcloud php occ maintenance:mode --off
+   trap - EXIT
+
+   restic forget --keep-daily 7 --keep-weekly 4 --keep-monthly 6 --prune
+
+El trap garantiza que Nextcloud sale del modo mantenimiento incluso si la copia falla. 6. Probar a mano y probar la restauración del volcado:
+
+bash
+   sudo chmod +x /usr/local/bin/backup-nextcloud.sh
+   sudo /usr/local/bin/backup-nextcloud.sh
+   sudo restic -r /mnt/backup-externo/restic-nextcloud --password-file /root/.restic-password-nextcloud restore latest --target /tmp/prueba-nc --include /var/backups/nextcloud-db
+   sudo head -5 /tmp/prueba-nc/var/backups/nextcloud-db/nextcloud.sql
+   sudo rm -r /tmp/prueba-nc
+
+El archivo debe empezar con PostgreSQL database dump. Una línea \restrict ... justo después es normal en las versiones recientes de PostgreSQL. 7. Programar a las 4:00 (después de la copia de las 3:30) y dejar el montaje fijo por UUID:
+
+bash
+   echo "0 4 * * * root /usr/local/bin/backup-nextcloud.sh >> /var/log/backup-nextcloud.log 2>&1" | sudo tee /etc/cron.d/backup-nextcloud
+   sudo chmod 644 /etc/cron.d/backup-nextcloud
+
+   sudo cp /etc/fstab ~/fstab.bak2
+   sudo -v
+   UUID_EXT=$(sudo blkid -s UUID -o value /dev/sdX1); echo $UUID_EXT
+   echo "UUID=$UUID_EXT /mnt/backup-externo ntfs-3g uid=$(id -u),gid=$(id -g),nofail,x-systemd.device-timeout=10 0 0" | sudo tee -a /etc/fstab
+   sudo umount /mnt/backup-externo && sudo mount -a && mountpoint /mnt/backup-externo
+   sudo systemctl daemon-reload
+Prueba de reinicio: sudo reboot, y comprobar que los dos discos se montan solos, que los contenedores siguen en marcha (docker ps) y que la dirección HTTPS sigue publicada (tailscale serve status).
+Verificar al día siguiente: sudo tail -20 /var/log/backup-nextcloud.log debe terminar con snapshot ... saved.
+
+Resultado: dos copias automáticas cifradas y con versiones.
+
+Hora	Qué copia	Destino
+3:30	Pi-hole, /etc, .ssh	Memoria USB
+4:00	Nextcloud: archivos y base de datos	Disco externo
+
 ## 5. Problemas que encontré y cómo los resolví
 
 | Problema | Causa | Solución |
@@ -430,7 +619,13 @@ El servidor debe estar encendido a las 3:30 y con la USB conectada. Si no, el sc
 | sudo rechazaba la contraseña varias veces | El comando usaba sudo dos veces a la vez y los dos avisos se estorbaban | Usar un solo sudo por comando y guardar el UUID en una variable antes |
 | El bloque pegado con EOF se quedó esperando (>) | El EOF final tenía espacios delante y no se reconoció como cierre | Pegar el bloque con EOF en la primera columna, o usar printf |
 | cat daba Permission denied tras restaurar | Con sudo, los archivos restaurados quedan a nombre de root | Leerlos con sudo cat |
-
+| Aviso rojo "Acceso HTTPS y URLs" en el Resumen de Nextcloud | Se accedía por HTTP | Publicar con `tailscale serve` y configurar `overwriteprotocol` y los dominios de confianza |
+| Error en el registro de Nextcloud (`127.0.0.1:25`) | No hay servidor de correo y falló el mensaje de bienvenida de la cuenta | Es inofensivo; solo impide restablecer contraseñas por correo, así que se guardan en un gestor de contraseñas |
+| `mountpoint` daba `bad usage` | Se pasaron dos rutas, y acepta una por comando | Ejecutarlo una vez por cada ruta |
+| `mount` daba `Device or resource busy` | El disco había quedado montado del intento anterior | Comprobar con `findmnt`, desmontar y volver a montar |
+| `No such file or directory` al escribir una ruta | Se escribió la ruta sola, sin ningún comando delante | Anteponer el comando (`mkdir`, `cd`...) |
+| El cliente de sincronización mostraba poco espacio libre | La carpeta por defecto estaba en el disco del sistema | Elegir una carpeta en otro disco con más espacio |
+| Archivos "solo en línea" que no se podían copiar | Estaban solo en la nube de otro servicio, con su almacenamiento lleno | Descargarlos por tandas ("mantener siempre en este dispositivo"), copiarlos y verificar |
 
 ---
 
@@ -443,6 +638,7 @@ El servidor debe estar encendido a las 3:30 y con la USB conectada. Si no, el sc
 - **VPN:** acceso remoto sin abrir puertos.
 - **Buenas prácticas:** probar los cambios con una vía de escape (`netplan try`, sesión SSH de respaldo) y documentar.
 - **copias cifradas con restic** política de retención, montaje automático con fstab y tareas programadas con cron.
+- **NextCloud** Desplegar una aplicación con varios contenedores, HTTPS con certificados de Tailscale, diferencia entre sincronizar y respaldar, volcados de bases de datos, retención de copias y tareas programadas.
 ---
 
 ## 7. Observaciones del equipo
@@ -459,7 +655,7 @@ El servidor debe estar encendido a las 3:30 y con la USB conectada. Si no, el sc
 - [x] Comprobar e instalar **fail2ban** (bloqueo automático de IPs que fallan al entrar por SSH).
 - [x] **Copias de seguridad** con `restic` a un disco externo y **probar la restauración**.
 - [ ] Configurar el **apagado ordenado** con poca batería.
-- [ ] Montar una **nube personal** (por ejemplo Nextcloud, con Docker), accediendo solo por Tailscale.
+- [x] Montar una **nube personal** (por ejemplo Nextcloud, con Docker), accediendo solo por Tailscale.
 - [ ] Opcional: `ssh-agent` en Windows para no escribir la frase en cada conexión.
 - [ ] Seguir el plan de estudio: Linux, redes, Docker, Python para seguridad y fundamentos de ciberseguridad.
 
